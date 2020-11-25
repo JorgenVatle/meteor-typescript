@@ -1,10 +1,42 @@
-#!/usr/bin/env ts-node
+#!/usr/bin/env ts-node-script
 
-// ts-node-script tests/compilerWatchTest.ts
+// Code mostly from the typescript-wiki, unmerged PR #225
+// https://github.com/microsoft/TypeScript-wiki/blob/ad7afb1b7049be5ac59ba55dce9a647390ee8481/Using-the-Compiler-API.md
+
+// run from root dir, i.e. ./compileTypescript.ts incremental
 
 import * as ts from "typescript";
+import readLine from "readline";
 
-function writeDiagnosticMessage(diagnostics: ts.Diagnostic, message: string) {
+const cachePath = "output";
+
+const isBuildInfo = (path: string) => path.includes("buildinfo");
+
+const system: ts.System = {
+  ...ts.sys,
+  //  write: (s) => console.log(s),
+  readFile: (path, encoding) => {
+    if (isBuildInfo(path)) {
+      console.log(`reading buildinfo from ${path}`);
+    }
+    return ts.sys.readFile(path, encoding);
+  },
+  writeFile: (path, data, writeByteOrderMark) => {
+    if (!isBuildInfo(path)) {
+      // console.log(`skipping writing of ${path} (${data.length} chars)`);
+      // return;
+    }
+    return ts.sys.writeFile(path, data, writeByteOrderMark);
+  },
+};
+
+function writeDiagnosticMessage(
+  diagnostics: ts.Diagnostic,
+  customMessage?: string
+) {
+  const message =
+    customMessage ||
+    ts.flattenDiagnosticMessageText(diagnostics.messageText, system.newLine);
   switch (diagnostics.category) {
     case ts.DiagnosticCategory.Error:
       return console.error(message);
@@ -15,7 +47,31 @@ function writeDiagnosticMessage(diagnostics: ts.Diagnostic, message: string) {
   }
 }
 
-function writeDiagnostics(diagnostics: ts.Diagnostic[]) {
+function reportDiagnostic(diagnostic: ts.Diagnostic) {
+  console.error(
+    "Error",
+    diagnostic.code,
+    ":",
+    ts.flattenDiagnosticMessageText(
+      diagnostic.messageText,
+      formatHost.getNewLine()
+    )
+  );
+}
+
+let triggerBug = false;
+
+const myResolvePath = (s: string) => (triggerBug ? s : system.resolvePath(s));
+
+const compilerOptions = (): ts.CompilerOptions => ({
+  tsBuildInfoFile: myResolvePath(`${cachePath}/buildfile.tsbuildinfo`),
+  incremental: true,
+  noEmit: false,
+  outDir: myResolvePath(`${cachePath}/out`),
+  sourceMap: true,
+});
+
+function writeDiagnostics(diagnostics: ReadonlyArray<ts.Diagnostic>) {
   diagnostics.forEach((diagnostic) => {
     if (diagnostic.file) {
       let { line, character } = diagnostic.file.getLineAndCharacterOfPosition(
@@ -30,13 +86,25 @@ function writeDiagnostics(diagnostics: ts.Diagnostic[]) {
         `${diagnostic.file.fileName} (${line + 1},${character + 1}): ${message}`
       );
     } else {
-      writeDiagnosticMessage(
-        diagnostic,
-        `${ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")}`
-      );
+      writeDiagnosticMessage(diagnostic);
     }
   });
 }
+
+const emitFile: ts.WriteFileCallback = (
+  fileName,
+  data,
+  writeByteOrderMark,
+  _,
+  sourceFiles
+) => {
+  console.log(
+    `emitting ${fileName} for ${
+      sourceFiles?.map((f) => f.fileName).join("+") ?? "??"
+    }`
+  );
+  system.writeFile(fileName, data, writeByteOrderMark);
+};
 
 function emitAllAffectedFiles<T extends ts.BuilderProgram>(program: T) {
   console.log("emitAllAffectedFiles invoked");
@@ -51,20 +119,14 @@ function emitAllAffectedFiles<T extends ts.BuilderProgram>(program: T) {
 
   /**
    * "emit" without a sourcefile will process all changed files, including the buildinfo file
-   * so we need to write it out if it changed.
-   * Then we can also tell which files were recompiled and put the data into the cache.
    */
-  const emitResult = program.emit(
-    undefined,
-    (fileName, data, writeByteOrderMark) => {
-      console.log(`emitting ${fileName}`);
-      ts.sys.writeFile(fileName, data, writeByteOrderMark);
-    }
-  );
+  const emitResult = program.emit(undefined, emitFile);
   emitResult.emittedFiles?.forEach((emittedFile) =>
     console.log(`Emitted ${emittedFile}`)
   );
   console.log(`Emitting complete`);
+  writeDiagnostics(emitResult.diagnostics);
+  return emitResult;
 }
 
 export const formatHost: ts.FormatDiagnosticsHost = {
@@ -73,56 +135,24 @@ export const formatHost: ts.FormatDiagnosticsHost = {
   getNewLine: () => ts.sys.newLine,
 };
 
-const cachePath =
-  ".meteor/local/plugin-cache/refapp_meteor-typescript/local/v2cache";
-
 function watchMain() {
   const configPath = ts.findConfigFile(
     /*searchPath*/ "./",
-    ts.sys.fileExists,
+    system.fileExists,
     "tsconfig.json"
   );
   if (!configPath) {
     throw new Error("Could not find a valid 'tsconfig.json'.");
   }
 
-  // TypeScript can use several different program creation "strategies":
-  //  * ts.createEmitAndSemanticDiagnosticsBuilderProgram,
-  //  * ts.createSemanticDiagnosticsBuilderProgram
-  //  * ts.createAbstractBuilder
-  // The first two produce "builder programs". These use an incremental strategy
-  // to only re-check and emit files whose contents may have changed, or whose
-  // dependencies may have changes which may impact change the result of prior
-  // type-check and emit.
-  // The last uses an ordinary program which does a full type check after every
-  // change.
-  // Between `createEmitAndSemanticDiagnosticsBuilderProgram` and
-  // `createSemanticDiagnosticsBuilderProgram`, the only difference is emit.
-  // For pure type-checking scenarios, or when another tool/process handles emit,
-  // using `createSemanticDiagnosticsBuilderProgram` may be more desirable.
   const createProgram = ts.createEmitAndSemanticDiagnosticsBuilderProgram;
 
   // Note that there is another overload for `createWatchCompilerHost` that takes
   // a set of root files.
   const host = ts.createWatchCompilerHost(
     configPath,
-    {
-      tsBuildInfoFile: `${cachePath}/buildinfo.tsbuildinfo`,
-      incremental: true,
-      noEmit: false,
-      outDir: `${cachePath}/out/`,
-      sourceMap: true,
-    },
-    {
-      ...ts.sys,
-      write: (s) => console.log(s),
-      readFile: (path, encoding) => {
-        if (path.includes("buildinfo")) {
-          console.log(`reading ${path}`);
-        }
-        return ts.sys.readFile(path, encoding);
-      },
-    },
+    compilerOptions(),
+    system,
     createProgram,
     reportDiagnostic,
     reportWatchStatusChanged
@@ -138,32 +168,6 @@ function watchMain() {
     return origCreateProgram(rootNames, options, host, oldProgram);
   };
 
-  const origPostProgramCreate = host.afterProgramCreate;
-  const customAfterProgramCreate: typeof host.afterProgramCreate = (
-    program
-  ) => {
-    const { emit: origEmit } = program;
-    console.log("** We finished making the program! **");
-    origPostProgramCreate?.({
-      ...program,
-      emit: (targetSourceFile, origWriteFile, ...emitRest) => {
-        const writeFile: typeof origWriteFile = (path, ...rest) => {
-          console.log(`emitting ${path} writeFile`);
-          const realWriteFile = origWriteFile ?? ts.sys.writeFile;
-          realWriteFile(path, ...rest);
-        };
-        console.log(`Emitting`);
-        const result = origEmit(targetSourceFile, writeFile, ...emitRest);
-        result.emittedFiles?.forEach((emittedFile) =>
-          console.log(`Emitted ${emittedFile}`)
-        );
-        console.log(`Emitting complete`);
-        return result;
-      },
-    });
-    if (customAfterProgramCreate) {
-    }
-  };
   host.afterProgramCreate = emitAllAffectedFiles;
 
   // `createWatchProgram` creates an initial program, watches files, and updates
@@ -171,15 +175,43 @@ function watchMain() {
   return ts.createWatchProgram(host);
 }
 
-function reportDiagnostic(diagnostic: ts.Diagnostic) {
-  console.error(
-    "Error",
-    diagnostic.code,
-    ":",
-    ts.flattenDiagnosticMessageText(
-      diagnostic.messageText,
-      formatHost.getNewLine()
-    )
+/**
+ * Performs one incremental compilation of the sources
+ */
+function incrementalMain() {
+  const configPath = ts.findConfigFile(
+    /*searchPath*/ "./",
+    system.fileExists,
+    "tsconfig.json"
+  );
+  if (!configPath) {
+    throw new Error("Could not find a valid 'tsconfig.json'.");
+  }
+
+  const config = ts.getParsedCommandLineOfConfigFile(
+    configPath,
+    /*optionsToExtend*/ compilerOptions(),
+    /*host*/ {
+      ...ts.sys,
+      onUnRecoverableConfigFileDiagnostic: (d) => writeDiagnosticMessage(d),
+    }
+  );
+  if (!config) {
+    throw new Error("Could not parse 'tsconfig.json'.");
+  }
+
+  const host = ts.createIncrementalCompilerHost(config.options, system);
+  const program = ts.createIncrementalProgram({
+    host,
+    rootNames: config.fileNames,
+    options: config.options,
+    configFileParsingDiagnostics: ts.getConfigFileParsingDiagnostics(config),
+    projectReferences: config.projectReferences,
+    createProgram: ts.createEmitAndSemanticDiagnosticsBuilderProgram,
+  });
+  const emitResult = emitAllAffectedFiles(program);
+  console.log(
+    `Incremental compilation ${emitResult.emitSkipped ? "failed" : "succeeded"}`
   );
 }
 
@@ -188,10 +220,39 @@ function reportDiagnostic(diagnostic: ts.Diagnostic) {
  * This is mainly for messages like "Starting compilation" or "Compilation completed".
  */
 function reportWatchStatusChanged(diagnostic: ts.Diagnostic) {
-  console.info("reportWatchStatusChanged");
-  console.info(ts.formatDiagnostic(diagnostic, formatHost));
+  console.info(
+    `reportWatchStatusChanged: ${ts.formatDiagnostic(diagnostic, formatHost)}`
+  );
+}
+const rl = readLine.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+// const variant = (process.argv[2] || "watch").toLowerCase();
+// console.log(`Compiling using ${variant} mode`);
+const variant: string = "incremental";
+
+console.log(`Typescript ${ts.version}`);
+if (process.argv[2]?.toLowerCase() === "triggerbug") {
+  triggerBug = true;
+  console.log(`Triggering the bug by not resolving paths`);
 }
 
-const watch = watchMain();
-if (watch) {
+switch (variant) {
+  case "watch":
+    const watch = watchMain();
+    rl.question("Press enter to exit", () => {
+      watch.close();
+    });
+    break;
+  case "incremental":
+    incrementalMain();
+    break;
+  default:
+    console.error(`Unknown variant ${variant}`);
+    process.exit(2);
+    break;
 }
+
+rl.close();
