@@ -4,17 +4,81 @@
 
 import * as ts from "typescript";
 
+function writeDiagnosticMessage(diagnostics: ts.Diagnostic, message: string) {
+  switch (diagnostics.category) {
+    case ts.DiagnosticCategory.Error:
+      return console.error(message);
+    case ts.DiagnosticCategory.Warning:
+    case ts.DiagnosticCategory.Suggestion:
+    case ts.DiagnosticCategory.Message:
+      return console.info(message);
+  }
+}
+
+function writeDiagnostics(diagnostics: ts.Diagnostic[]) {
+  diagnostics.forEach((diagnostic) => {
+    if (diagnostic.file) {
+      let { line, character } = diagnostic.file.getLineAndCharacterOfPosition(
+        diagnostic.start!
+      );
+      let message = ts.flattenDiagnosticMessageText(
+        diagnostic.messageText,
+        "\n"
+      );
+      writeDiagnosticMessage(
+        diagnostic,
+        `${diagnostic.file.fileName} (${line + 1},${character + 1}): ${message}`
+      );
+    } else {
+      writeDiagnosticMessage(
+        diagnostic,
+        `${ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n")}`
+      );
+    }
+  });
+}
+
+function emitAllAffectedFiles<T extends ts.BuilderProgram>(program: T) {
+  console.log("emitAllAffectedFiles invoked");
+  const diagnostics = [
+    ...program.getConfigFileParsingDiagnostics(),
+    ...program.getSyntacticDiagnostics(),
+    ...program.getOptionsDiagnostics(),
+    ...program.getGlobalDiagnostics(),
+    ...program.getSemanticDiagnostics(), // Get the diagnostics before emit to cache them in the buildInfo file.
+  ];
+  writeDiagnostics(diagnostics);
+
+  /**
+   * "emit" without a sourcefile will process all changed files, including the buildinfo file
+   * so we need to write it out if it changed.
+   * Then we can also tell which files were recompiled and put the data into the cache.
+   */
+  const emitResult = program.emit(
+    undefined,
+    (fileName, data, writeByteOrderMark) => {
+      console.log(`emitting ${fileName}`);
+      ts.sys.writeFile(fileName, data, writeByteOrderMark);
+    }
+  );
+  emitResult.emittedFiles?.forEach((emittedFile) =>
+    console.log(`Emitted ${emittedFile}`)
+  );
+  console.log(`Emitting complete`);
+}
+
 export const formatHost: ts.FormatDiagnosticsHost = {
   getCanonicalFileName: (path) => path,
   getCurrentDirectory: ts.sys.getCurrentDirectory,
   getNewLine: () => ts.sys.newLine,
 };
 
-const cachePath = "./outfiles"; //  "../.meteor/local/plugin-cache/refapp_meteor-typescript/local/v2cache";
+const cachePath =
+  ".meteor/local/plugin-cache/refapp_meteor-typescript/local/v2cache";
 
 function watchMain() {
   const configPath = ts.findConfigFile(
-    /*searchPath*/ "../",
+    /*searchPath*/ "./",
     ts.sys.fileExists,
     "tsconfig.json"
   );
@@ -73,9 +137,11 @@ function watchMain() {
     console.log("** We're about to create the program! **");
     return origCreateProgram(rootNames, options, host, oldProgram);
   };
-  const origPostProgramCreate = host.afterProgramCreate;
 
-  host.afterProgramCreate = (program) => {
+  const origPostProgramCreate = host.afterProgramCreate;
+  const customAfterProgramCreate: typeof host.afterProgramCreate = (
+    program
+  ) => {
     const { emit: origEmit } = program;
     console.log("** We finished making the program! **");
     origPostProgramCreate?.({
@@ -95,7 +161,10 @@ function watchMain() {
         return result;
       },
     });
+    if (customAfterProgramCreate) {
+    }
   };
+  host.afterProgramCreate = emitAllAffectedFiles;
 
   // `createWatchProgram` creates an initial program, watches files, and updates
   // the program over time.
